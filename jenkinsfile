@@ -1,0 +1,123 @@
+pipeline {
+    agent any
+
+    environment {
+        REMOTE_USER = "ubuntu"
+        REMOTE_HOST = "52.53.231.14"
+        REMOTE_DIR  = "/home/ubuntu/jarvis"
+        SSH_OPTS    = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        CRED_ID     = "jarvis-key"
+        SERVICE_NAME = "jarvis.service"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/iampooja-jadhav/Jarvis-Voice-Assistant-Project.git'
+            }
+        }
+
+        stage('Package & Transfer') {
+            steps {
+                sshagent(credentials: ["${CRED_ID}"]) {
+                    sh """
+                        # Create remote directory
+                        ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "mkdir -p ${REMOTE_DIR}"
+
+                        # Use SSH options for rsync
+                        rsync -avz -e "ssh ${SSH_OPTS}" \
+                        --delete --exclude='.git' ./ ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/
+                    """
+                }
+            }
+        }
+
+        stage('Remote: Setup venv & install updated dependencies') {
+            steps {
+                sshagent(credentials: ["${CRED_ID}"]) {
+                    sh """
+ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} << 'EOF'
+set -e
+cd ${REMOTE_DIR}
+
+echo "Installing Python dependencies..."
+sudo apt update -y || true
+sudo apt install -y python3 python3-pip python3-venv python3.12-venv python3.12-full espeak-ng espeak-ng-data || true
+
+# Create venv if not exists
+if [ ! -d "venv" ]; then
+  python3 -m venv venv
+fi
+
+. venv/bin/activate
+pip install --upgrade pip setuptools wheel || true
+
+if [ -f requirements.txt ]; then
+  pip install -r requirements.txt || true
+fi
+
+EOF
+"""
+                }
+            }
+        }
+
+        stage('Remote: Create/update systemd unit') {
+            steps {
+                sshagent(credentials: ["${CRED_ID}"]) {
+                    sh """
+ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} << 'EOF'
+set -e
+
+UNITFILE=/etc/systemd/system/${SERVICE_NAME}
+
+sudo tee \$UNITFILE > /dev/null << 'UNIT'
+[Unit]
+Description=Jarvis Desktop Voice Assistant
+After=network.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=${REMOTE_DIR}
+Environment=PATH=${REMOTE_DIR}/venv/bin:/usr/bin:/bin
+Environment=DISPLAY=:99
+Restart=on-failure
+RestartSec=5
+ExecStart=${REMOTE_DIR}/venv/bin/python ${REMOTE_DIR}/Jarvis/jarvis.py
+StandardOutput=append:${REMOTE_DIR}/jarvis.stdout.log
+StandardError=append:${REMOTE_DIR}/jarvis.stderr.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+sudo systemctl daemon-reload
+echo "Updated service file -> \$UNITFILE"
+
+EOF
+"""
+                }
+            }
+        }
+
+        stage('Restart service & verify') {
+            steps {
+                sshagent(credentials: ["${CRED_ID}"]) {
+                    sh """
+ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} << 'EOF'
+sudo systemctl restart ${SERVICE_NAME}
+sleep 2
+sudo systemctl status ${SERVICE_NAME} --no-pager -n 30 || true
+
+echo "---- Latest logs ----"
+sudo journalctl -u ${SERVICE_NAME} -n 30 --no-pager || true
+EOF
+"""
+                }
+            }
+        }
+    }
+}
